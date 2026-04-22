@@ -28,6 +28,13 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+
+# Playwright — опциональная зависимость для JS-сайтов (kaspi.kz и т.п.)
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    PLAYWRIGHT_OK = True
+except ImportError:
+    PLAYWRIGHT_OK = False
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -41,7 +48,7 @@ from telegram.ext import (
 # ═══════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
 # ═══════════════════════════════════════════════════════════════
-BOT_TOKEN       = os.getenv("BOT_TOKEN", "8756640177:AAH7J9OXyQvmjqadURaMNWXk78p7BwOKUuk")
+BOT_TOKEN       = os.getenv("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
 DB_PATH         = Path(os.getenv("DB_PATH", "prices.db"))
 CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", 60 * 30))  # секунды
 REQUEST_TIMEOUT = 15
@@ -147,8 +154,33 @@ def db_update_price(item_id: int, new_price: float) -> None:
 #  ПАРСИНГ ЦЕН
 # ═══════════════════════════════════════════════════════════════
 
-def _fetch_soup(url: str) -> BeautifulSoup | None:
-    """Загружает страницу и возвращает BeautifulSoup или None при ошибке."""
+def _resolve_url(url: str) -> str:
+    """
+    Раскрывает сокращённые ссылки (l.kaspi.kz, bit.ly и т.п.)
+    через HEAD-запрос с отслеживанием редиректов.
+    """
+    try:
+        resp = requests.head(
+            url, headers=HEADERS, timeout=REQUEST_TIMEOUT,
+            proxies=PROXIES, allow_redirects=True
+        )
+        final = resp.url
+        log.info("Редирект: %s → %s", url, final)
+        return final
+    except requests.RequestException:
+        return url  # не удалось — вернём оригинал
+
+
+# Домены, которые требуют Playwright (JS-рендеринг)
+_PLAYWRIGHT_DOMAINS = {"kaspi.kz", "ozon.ru", "ozon.kz"}
+
+def _needs_playwright(url: str) -> bool:
+    netloc = urlparse(url).netloc.lower()
+    return any(d in netloc for d in _PLAYWRIGHT_DOMAINS)
+
+
+def _fetch_soup_requests(url: str) -> BeautifulSoup | None:
+    """Обычная загрузка через requests."""
     try:
         resp = requests.get(
             url, headers=HEADERS, timeout=REQUEST_TIMEOUT, proxies=PROXIES
@@ -156,8 +188,56 @@ def _fetch_soup(url: str) -> BeautifulSoup | None:
         resp.raise_for_status()
         return BeautifulSoup(resp.text, "lxml")
     except requests.RequestException as e:
-        log.warning("Ошибка загрузки %s: %s", url, e)
+        log.warning("Ошибка requests %s: %s", url, e)
         return None
+
+
+def _fetch_soup_playwright(url: str) -> BeautifulSoup | None:
+    """
+    Загружает страницу через Playwright (Chromium без GUI).
+    Ждёт, пока сеть успокоится — JS успевает отрендерить цену.
+    """
+    if not PLAYWRIGHT_OK:
+        log.warning("Playwright не установлен, используем requests для %s", url)
+        return _fetch_soup_requests(url)
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            ctx = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                locale="ru-RU",
+                extra_http_headers={"Accept-Language": HEADERS["Accept-Language"]},
+                **({"proxy": {"server": _proxy}} if _proxy else {}),
+            )
+            page = ctx.new_page()
+            page.goto(url, wait_until="networkidle", timeout=30_000)
+            html = page.content()
+            browser.close()
+        return BeautifulSoup(html, "lxml")
+    except PWTimeout:
+        log.warning("Playwright timeout для %s", url)
+        return None
+    except Exception as e:
+        log.warning("Playwright ошибка %s: %s", url, e)
+        return None
+
+
+def _fetch_soup(url: str) -> tuple[BeautifulSoup | None, str]:
+    """
+    Возвращает (soup, финальный_url).
+    Автоматически раскрывает короткие ссылки и выбирает загрузчик.
+    """
+    # 1. Раскрываем сокращённые ссылки
+    final_url = _resolve_url(url)
+
+    # 2. Выбираем загрузчик
+    if _needs_playwright(final_url):
+        soup = _fetch_soup_playwright(final_url)
+    else:
+        soup = _fetch_soup_requests(final_url)
+
+    return soup, final_url
 
 
 def extract_price_from_text(text: str) -> float | None:
@@ -176,31 +256,52 @@ def extract_price_from_text(text: str) -> float | None:
 # ── Специализированные парсеры ───────────────────────────────────────────────
 
 def _parse_kaspi(soup: BeautifulSoup) -> float | None:
-    """kaspi.kz — JSON в __NEXT_DATA__ → span с классом цены."""
-    # 1. Пробуем React-данные в <script id="__NEXT_DATA__">
+    """
+    kaspi.kz — страница загружена через Playwright, JS уже выполнен.
+    Пробуем: __NEXT_DATA__ JSON → data-атрибуты → CSS-селекторы цены.
+    """
+    # 1. __NEXT_DATA__ (Next.js hydration payload)
     nd = soup.find("script", id="__NEXT_DATA__")
     if nd:
         with contextlib.suppress(Exception):
             data = json.loads(nd.string)
-            price = (
-                data["props"]["pageProps"]
-                    .get("productData", {})
-                    .get("offer", {})
-                    .get("price")
-            )
-            if price:
-                return float(price)
-    # 2. Фолбэк по CSS-селектору
+            # Путь может меняться — ищем рекурсивно ключ "price"
+            def _find_price(obj, depth=0):
+                if depth > 8:
+                    return None
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if k in ("price", "unitPrice", "salePrice") and isinstance(v, (int, float)):
+                            return float(v)
+                        result = _find_price(v, depth + 1)
+                        if result:
+                            return result
+                elif isinstance(obj, list):
+                    for item in obj:
+                        result = _find_price(item, depth + 1)
+                        if result:
+                            return result
+                return None
+            price = _find_price(data)
+            if price and price > 0:
+                return price
+
+    # 2. CSS-селекторы (после JS-рендеринга классы присутствуют)
     for sel in (
+        "div.item__price-once",
         "span.item__price-once",
-        "[data-zone-name='price'] span",
-        ".price-block span",
+        "[data-zone-name='price'] [class*='price']",
+        ".offer__price",
+        "[class*='price-block__price']",
+        "span[class*='Price']",
+        "div[class*='Price']",
     ):
         tag = soup.select_one(sel)
         if tag:
             p = extract_price_from_text(tag.get_text())
-            if p:
+            if p and p > 0:
                 return p
+
     return None
 
 
@@ -320,18 +421,19 @@ def _parse_generic(soup: BeautifulSoup) -> float | None:
 
 # ── Публичный интерфейс ──────────────────────────────────────────────────────
 
-def parse_price(url: str) -> tuple[float | None, str]:
+def parse_price(url: str) -> tuple[float | None, str, str]:
     """
-    Возвращает (цена, название).
+    Возвращает (цена, название, финальный_url).
+    финальный_url может отличаться от оригинала если была короткая ссылка.
     Порядок: специфичный парсер → универсальный фолбэк.
     """
-    soup = _fetch_soup(url)
+    soup, final_url = _fetch_soup(url)
     if soup is None:
-        return None, ""
+        return None, "", url
 
     price: float | None = None
 
-    shop_fn = _get_shop_parser(url)
+    shop_fn = _get_shop_parser(final_url)
     if shop_fn:
         with contextlib.suppress(Exception):
             price = shop_fn(soup)
@@ -346,9 +448,9 @@ def parse_price(url: str) -> tuple[float | None, str]:
         title = og["content"]
     elif soup.title:
         title = soup.title.get_text(strip=True)
-    title = (title or urlparse(url).netloc).strip()[:120]
+    title = (title or urlparse(final_url).netloc).strip()[:120]
 
-    return price, title
+    return price, title, final_url
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -466,8 +568,8 @@ async def on_link(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     url = m.group(0)
     await update.message.reply_text("🔎 Загружаю страницу, ищу цену...")
 
-    price, title = await asyncio.to_thread(parse_price, url)
-    await asyncio.to_thread(db_add_item, update.effective_user.id, url, title, price)
+    price, title, final_url = await asyncio.to_thread(parse_price, url)
+    await asyncio.to_thread(db_add_item, update.effective_user.id, final_url, title, price)
 
     if price is None:
         await update.message.reply_text(
@@ -500,7 +602,7 @@ async def check_all_prices(
         if notify_user_id is not None and uid != notify_user_id:
             continue
 
-        new_price, _ = await asyncio.to_thread(parse_price, row["url"])
+        new_price, _, _url = await asyncio.to_thread(parse_price, row["url"])
         if new_price is None:
             continue
 

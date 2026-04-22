@@ -48,7 +48,7 @@ from telegram.ext import (
 # ═══════════════════════════════════════════════════════════════
 #  НАСТРОЙКИ
 # ═══════════════════════════════════════════════════════════════
-BOT_TOKEN       = os.getenv("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
+BOT_TOKEN       = os.getenv("BOT_TOKEN", "8756640177:AAH7J9OXyQvmjqadURaMNWXk78p7BwOKUuk")
 DB_PATH         = Path(os.getenv("DB_PATH", "prices.db"))
 CHECK_INTERVAL  = int(os.getenv("CHECK_INTERVAL", 60 * 30))  # секунды
 REQUEST_TIMEOUT = 15
